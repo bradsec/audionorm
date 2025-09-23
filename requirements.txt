@@ -1,0 +1,25 @@
+# Core audio processing dependencies
+torch>=2.8.0,<3.0.0
+torchaudio>=2.8.0,<3.0.0
+demucs>=4.0.1,<5.0.0
+
+# SpeechBrain for voice enhancement
+speechbrain>=1.0.3,<2.0.0
+
+# Audio analysis and I/O
+librosa>=0.11.0,<1.0.0
+soundfile>=0.13.0,<1.0.0
+numpy>=2.2.0,<3.0.0
+scipy>=1.16.0,<2.0.0
+
+# Noise reduction and enhancement
+noisereduce>=3.0.0,<4.0.0
+
+# UI and progress display
+rich>=14.0.0,<15.0.0
+
+# Transcription dependencies
+faster-whisper>=1.2.0,<2.0.0
+
+# Optional dependencies for additional formats
+# pip install ffmpeg-python  # For additional audio format support
