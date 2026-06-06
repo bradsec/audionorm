@@ -81,7 +81,7 @@ python audioscribe.py --help
 
 ## AudioNorm - Audio Enhancement
 
-### AudioNorm Features
+### Features
 
 - **SpeechBrain Enhancement**: MTL-MIMIC model for voice quality improvement
 - **Demucs AI Denoising**: htdemucs_ft model optimized for vocal separation
@@ -90,7 +90,7 @@ python audioscribe.py --help
 - **Intelligent Processing**: Auto-detects optimal processing pipeline
 - **Batch Processing**: Handle entire directories recursively
 
-### AudioNorm Examples
+### Usage
 
 ```bash
 usage: audionorm.py [-h] [--target-lufs TARGET_LUFS] [--model MODEL] [--device {cpu,cuda}] [--recursive] [--keep-temp] [--skip-demucs] [--enhanced-cleaning]
@@ -146,7 +146,7 @@ Examples:
 
 ## AudioScribe - Speech Transcription
 
-### Core Features
+### Features
 
 - **Faster-Whisper Models**: Optimized Whisper implementation
 - **Multi-language Support**: 60+ languages with auto-detection
