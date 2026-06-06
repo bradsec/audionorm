@@ -14,13 +14,62 @@ Usage:
 import argparse
 import importlib.util
 import logging
-import secrets
+import random
 import shutil
 import subprocess  # nosec B404 - Used for FFmpeg calls with validated inputs
 import sys
+import threading
+import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+# Local imports
+from audio_constants import (
+    SUPPORTED_AUDIO_FORMATS,
+    ProcessingResult,
+    validate_audio_file,
+    cleanup_temp_files,
+)
+
+
+@dataclass
+class AudioProcessingConfig:
+    """Configuration for audio processing pipeline."""
+    target_lufs: float = -23.0
+    keep_temp: bool = False
+    skip_demucs: bool = False
+    enhanced_cleaning: bool = False
+    python_restoration: bool = False
+    trim_silence: bool = False
+    silence_threshold: float = -30.0
+    intensive_cleanup: bool = False
+    use_dynaudnorm: bool = True
+    use_two_pass_loudnorm: bool = False
+    speechbrain_enhance: bool = True
+    save_stems: bool = False
+    stems_only: bool = False
+    overwrite: bool = False
+    output_format: str = "wav"
+    voice_consistent: bool = False
+    separator: str = "roformer"
+
+    def to_dict(self) -> dict:
+        """Convert config to dictionary for pipeline functions."""
+        return {
+            'target_lufs': self.target_lufs,
+            'enhanced_cleaning': self.enhanced_cleaning,
+            'intensive_cleanup': self.intensive_cleanup,
+            'use_dynaudnorm': self.use_dynaudnorm,
+            'use_two_pass_loudnorm': self.use_two_pass_loudnorm,
+            'trim_silence': self.trim_silence,
+            'silence_threshold': self.silence_threshold,
+            'output_format': self.output_format,
+            'save_stems': self.save_stems,
+            'voice_consistent': self.voice_consistent,
+            'separator': self.separator,
+        }
 
 # Third-party imports
 import numpy as np
@@ -49,9 +98,52 @@ except ImportError:
     logging.warning("soundfile not available, using torchaudio for audio I/O")
 
 HAS_SPEECHBRAIN = importlib.util.find_spec("speechbrain") is not None
+HAS_AUDIO_SEPARATOR = importlib.util.find_spec("audio_separator") is not None
 
 # Global console for rich output
 console = Console()
+
+import re as _re
+
+class _TqdmInterceptor:
+    """Fakes a tty so tqdm emits output; parses percentage for Rich progress.
+
+    Handles multi-cycle separators (e.g. BagOfModels runs N tqdm bars sequentially).
+    Pass expected_cycles so each cycle gets an equal share of the progress bar.
+    """
+    def __init__(self, expected_cycles: int = 1):
+        self._expected = max(1, expected_cycles)
+        self._completed = 0
+        self._last_raw = -1
+        self._watermark = 0
+        self.latest_pct: int = 0
+
+    @property
+    def display_pct(self) -> int:
+        total = max(self._expected, self._completed + 1)
+        per = 100.0 / total
+        raw = int(self._completed * per + self.latest_pct * per / 100.0)
+        result = max(self._watermark, raw)
+        self._watermark = result
+        return result
+
+    def write(self, text: str):
+        clean = _re.sub(r'\x1b\[[0-9;]*[mK]', '', text)
+        m = _re.search(r'\b(\d+)%', clean)
+        if m:
+            pct = int(m.group(1))
+            if self._last_raw > 50 and pct < 10:
+                self._completed += 1
+            self._last_raw = pct
+            self.latest_pct = pct
+
+    def flush(self):
+        pass
+
+    def isatty(self) -> bool:
+        return True
+
+_tqdm_intercept: Optional[_TqdmInterceptor] = None
 
 # Configure logging with suppressed output by default
 logging.basicConfig(
@@ -142,6 +234,154 @@ HISS_REDUCTION_7K_FILTER = "equalizer=f=7000:width_type=o:width=2:g=-2"
 HISS_REDUCTION_10K_FILTER = "equalizer=f=10000:width_type=o:width=2:g=-1"
 VOICE_WARMTH_FILTER = "equalizer=f=200:width_type=o:width=2:g=1"
 VOICE_CLARITY_FILTER = "equalizer=f=2500:width_type=o:width=2:g=0.5"
+
+_ROFORMER_MODELS = {
+    "roformer": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+    "mel-roformer": "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+}
+
+
+def load_bsroformer_separator(
+    separator: str = "roformer",
+    model_file_dir: str = "pretrained_models/",
+):
+    """Load a RoFormer vocal separator model (BS-RoFormer or Mel-RoFormer).
+
+    Returns Separator instance or None if audio-separator is not installed.
+    """
+    if not HAS_AUDIO_SEPARATOR:
+        if not QUIET_MODE:
+            console.print(
+                "  [yellow]audio-separator not installed. "
+                "Install with: pip install audio-separator[/yellow]"
+            )
+        return None
+    model_file = _ROFORMER_MODELS.get(separator, _ROFORMER_MODELS["roformer"])
+    label = "Mel-RoFormer (SDR 11.4)" if separator == "mel-roformer" else "BS-RoFormer (SDR 12.97)"
+    try:
+        from audio_separator.separator import Separator
+        if not QUIET_MODE:
+            console.print(f"  [cyan]Loading {label}...[/cyan]")
+        sep = Separator(
+            log_level=logging.WARNING,
+            model_file_dir=model_file_dir,
+            output_format="WAV",
+        )
+        sep.load_model(model_file)
+        return sep
+    except Exception as e:
+        logging.error(f"Failed to load {label}: {e}")
+        return None
+
+
+def run_bsroformer_denoise(input_file: Path, output_file: Path, separator) -> bool:
+    """Extract vocals using BS-RoFormer for the normalization pipeline.
+
+    Args:
+        input_file: Input audio file
+        output_file: Destination path for extracted vocals
+        separator: Loaded audio_separator.separator.Separator instance
+
+    Returns:
+        bool: Success status
+    """
+    try:
+        separator.output_dir = str(input_file.parent)
+        from contextlib import redirect_stderr
+        from io import StringIO
+        stderr_sink = _tqdm_intercept if _tqdm_intercept is not None else StringIO()
+        with redirect_stderr(stderr_sink):
+            output_files = separator.separate(str(input_file))
+
+        vocals_path = next(
+            (Path(f) for f in output_files if "(Vocals)" in f),
+            None
+        )
+        if not vocals_path or not vocals_path.exists():
+            logging.error(f"BS-RoFormer: vocals output not found in: {output_files}")
+            return False
+
+        shutil.copy2(vocals_path, output_file)
+
+        for f in output_files:
+            p = Path(f)
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError as e:
+                    logging.warning(f"Could not clean up BS-RoFormer output {p}: {e}")
+
+        return True
+
+    except Exception as e:
+        logging.error(f"BS-RoFormer separation failed for {input_file}: {e}")
+        return False
+
+
+def run_bsroformer_stems(
+    input_file: Path, output_dir: Path, base_name: str, separator
+) -> dict:
+    """Extract vocals and background stems using BS-RoFormer.
+
+    Produces {base_name}_vocals.wav and {base_name}_background.wav in output_dir.
+    Note: BS-RoFormer is 2-stem only (vocals + instrumental). No individual
+    drums/bass/other stems unlike Demucs.
+
+    Args:
+        input_file: Input audio file
+        output_dir: Directory to write final stems
+        base_name: Base filename (without extension) for output naming
+        separator: Loaded audio_separator.separator.Separator instance
+
+    Returns:
+        dict: {"vocals": Path, "background": Path} or {} on failure
+    """
+    try:
+        separator.output_dir = str(input_file.parent)
+        from contextlib import redirect_stderr
+        from io import StringIO
+        stderr_sink = _tqdm_intercept if _tqdm_intercept is not None else StringIO()
+        with redirect_stderr(stderr_sink):
+            output_files = separator.separate(str(input_file))
+
+        vocals_src = next(
+            (Path(f) for f in output_files if "(Vocals)" in f),
+            None
+        )
+        instrumental_src = next(
+            (Path(f) for f in output_files if "(Instrumental)" in f),
+            None
+        )
+
+        if not vocals_src or not vocals_src.exists():
+            logging.error(f"BS-RoFormer: vocals output not found in: {output_files}")
+            return {}
+
+        vocals_dest = output_dir / f"{base_name}_vocals.wav"
+        background_dest = output_dir / f"{base_name}_background.wav"
+
+        shutil.copy2(vocals_src, vocals_dest)
+        if instrumental_src and instrumental_src.exists():
+            shutil.copy2(instrumental_src, background_dest)
+
+        if VERBOSE_MODE:
+            logging.info(f"Saved vocals: {vocals_dest.name}")
+            logging.info(f"Saved background: {background_dest.name}")
+
+        for f in output_files:
+            p = Path(f)
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError as e:
+                    logging.warning(f"Could not clean up BS-RoFormer output {p}: {e}")
+
+        return {"vocals": vocals_dest, "background": background_dest}
+
+    except Exception as e:
+        logging.error(f"BS-RoFormer stem separation failed for {input_file}: {e}")
+        return {}
+
 
 def run_neural_noise_reduction(input_file: Path, output_file: Path, voice_optimized: bool = True) -> bool:
     """Apply FFmpeg's AI-based neural noise reduction (arnndn filter).
@@ -384,11 +624,41 @@ def _apply_intensive_cleanup(input_file: Path) -> tuple:
         logging.info("Neural/adaptive noise reduction failed, using standard intensive cleanup")
     return input_file, _get_standard_cleanup_filters(), [temp_neural_file, temp_adaptive_file]
 
-def run_speechbrain_enhance(input_file: Path, output_file: Path, model_name: str = "speechbrain/mtl-mimic-voicebank") -> bool:
-    """Apply SpeechBrain MTL-MIMIC enhancement for superior voice quality.
+def _suppress_speechbrain_logs() -> None:
+    """Suppress SpeechBrain debug logs when not in verbose mode."""
+    if VERBOSE_MODE:
+        return
+    speechbrain_logger = logging.getLogger('speechbrain')
+    speechbrain_logger.setLevel(logging.WARNING)
+    related_loggers = [
+        'speechbrain.utils.checkpoints', 'speechbrain.pretrained',
+        'speechbrain.utils.parameter_transfer', 'speechbrain.utils.fetching'
+    ]
+    for logger_name in related_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
-    MTL-MIMIC-Voicebank provides better voice enhancement than MetricGAN+ and
-    handles the API correctly with proper lengths parameter management.
+
+def _load_speechbrain_model(model_name: str):
+    """Load SpeechBrain enhancement model with GPU fallback."""
+    from speechbrain.inference.enhancement import WaveformEnhancement
+
+    try:
+        return WaveformEnhancement.from_hparams(
+            source=model_name,
+            savedir=f"pretrained_models/{model_name.split('/')[-1]}",
+            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"}
+        )
+    except Exception:
+        # Fallback without GPU options if CUDA unavailable
+        return WaveformEnhancement.from_hparams(source=model_name)
+
+
+def run_speechbrain_enhance(
+    input_file: Path,
+    output_file: Path,
+    model_name: str = "speechbrain/mtl-mimic-voicebank"
+) -> bool:
+    """Apply SpeechBrain MTL-MIMIC enhancement for superior voice quality.
 
     Args:
         input_file: Input audio file
@@ -398,14 +668,7 @@ def run_speechbrain_enhance(input_file: Path, output_file: Path, model_name: str
     Returns:
         bool: Success status
     """
-    # Suppress SpeechBrain debug logs if not in verbose mode
-    if not VERBOSE_MODE:
-        speechbrain_logger = logging.getLogger('speechbrain')
-        speechbrain_logger.setLevel(logging.WARNING)
-        # Suppress all related loggers
-        for logger_name in ['speechbrain.utils.checkpoints', 'speechbrain.pretrained',
-                           'speechbrain.utils.parameter_transfer', 'speechbrain.utils.fetching']:
-            logging.getLogger(logger_name).setLevel(logging.WARNING)
+    _suppress_speechbrain_logs()
 
     if not HAS_SPEECHBRAIN:
         if VERBOSE_MODE:
@@ -416,51 +679,22 @@ def run_speechbrain_enhance(input_file: Path, output_file: Path, model_name: str
         if VERBOSE_MODE:
             logging.info(f"Loading SpeechBrain model: {model_name}")
 
-        # Import using correct SpeechBrain 1.0+ API
-        from speechbrain.inference.enhancement import WaveformEnhancement
-        import torchaudio
-        import sys
-        import os
+        model = _load_speechbrain_model(model_name)
 
-        # Suppress stderr during entire SpeechBrain process if not in verbose mode
-        if not VERBOSE_MODE:
-            original_stderr = sys.stderr
-            sys.stderr = open(os.devnull, 'w')
+        if VERBOSE_MODE:
+            logging.info(f"Enhancing audio with SpeechBrain: {input_file.name}")
 
-        try:
-            # Load the enhancement model with GPU support if available
-            try:
-                model = WaveformEnhancement.from_hparams(
-                    source=model_name,
-                    savedir=f"pretrained_models/{model_name.split('/')[-1]}",
-                    run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"}
-                )
-            except Exception:
-                # Fallback without GPU options if CUDA unavailable
-                model = WaveformEnhancement.from_hparams(source=model_name)
+        # Load and enhance the audio
+        waveform, sample_rate = torchaudio.load(input_file)
+        enhanced = model.enhance_batch(waveform, lengths=torch.tensor([1.0]))
 
-            if VERBOSE_MODE:
-                logging.info(f"Enhancing audio with SpeechBrain: {input_file.name}")
+        # Save enhanced audio
+        torchaudio.save(output_file, enhanced.cpu(), sample_rate)
 
-            # Load and enhance the audio
-            waveform, sample_rate = torchaudio.load(input_file)
+        if VERBOSE_MODE:
+            logging.info(f"SpeechBrain enhancement complete: {output_file.name}")
 
-            # Process with SpeechBrain enhancement
-            enhanced = model.enhance_batch(waveform, lengths=torch.tensor([1.0]))
-
-            # Save enhanced audio
-            torchaudio.save(output_file, enhanced.cpu(), sample_rate)
-
-            if VERBOSE_MODE:
-                logging.info(f"SpeechBrain enhancement complete: {output_file.name}")
-
-            return True
-
-        finally:
-            # Restore stderr
-            if not VERBOSE_MODE:
-                sys.stderr.close()
-                sys.stderr = original_stderr
+        return True
 
     except Exception as e:
         if VERBOSE_MODE:
@@ -764,11 +998,9 @@ def run_ffmpeg_normalize(
             if VERBOSE_MODE:
                 logging.info("Using two-pass loudnorm for superior volume consistency")
             return run_two_pass_loudnorm(input_file, temp_file, target_lufs)
-        elif voice_consistent:
+        elif voice_consistent and VERBOSE_MODE:
             # Voice-consistent mode overrides two-pass
-            if VERBOSE_MODE:
-                logging.info("Using voice-consistent normalization for uniform voice levels")
-            pass  # Continue to filter-based approach below
+            logging.info("Using voice-consistent normalization for uniform voice levels")
 
         # Get appropriate filters based on mode
         filters = _get_normalization_filters(target_lufs, use_dynaudnorm, enhanced_cleaning, voice_consistent)
@@ -972,10 +1204,7 @@ def run_silence_trimmer(
     """
     try:
         # Generate random pause length for natural variation
-        # Use secrets.randbelow for cryptographically secure randomness
-        range_ms = int((max_pause_length - min_pause_length) * 1000)
-        random_ms = secrets.randbelow(range_ms + 1)
-        target_pause = min_pause_length + (random_ms / 1000.0)
+        target_pause = random.uniform(min_pause_length, max_pause_length)
         
         if VERBOSE_MODE:
             logging.info(f"Trimming silences >{min_silence_duration}s to {target_pause:.2f}s at {silence_threshold}dB threshold")
@@ -1102,29 +1331,29 @@ def _prepare_audio_channels(wav: torch.Tensor) -> torch.Tensor:
 
 def _apply_demucs_separation(model, wav: torch.Tensor, device: str, sr: int) -> torch.Tensor:
     """Apply Demucs separation and extract vocals."""
+    from contextlib import redirect_stderr
+    from io import StringIO
     chunk_size = sr * 30  # 30 second chunks
     if VERBOSE_MODE:
         logging.info(f"Audio length: {wav.shape[-1]} samples, chunk size: {chunk_size}, will chunk: {wav.shape[-1] > chunk_size}")
 
-    if wav.shape[-1] <= chunk_size:
-        # Separate into stems and extract vocals only
-        separated = apply_model(model, wav[None], device=device, progress=False)
-        # Extract vocals stem (index 3) for voice/music separation
-        # htdemucs model outputs: [0] drums, [1] bass, [2] other, [3] vocals
-        denoised = separated[0][3]  # Extract vocals stem only
-        if VERBOSE_MODE:
-            logging.info(f"Extracted vocals stem from Demucs separation, shape: {denoised.shape}")
-    else:
-        # Process long files in chunks
-        chunks = []
-        for i in range(0, wav.shape[-1], chunk_size):
-            chunk = wav[:, i : i + chunk_size]
-            separated = apply_model(model, chunk[None], device=device, progress=False)
-            chunk_vocals = separated[0][3]  # Extract vocals stem only
-            chunks.append(chunk_vocals.cpu())
-        denoised = torch.cat(chunks, dim=-1)
-        if VERBOSE_MODE:
-            logging.info(f"Extracted vocals stem from Demucs separation (chunked), shape: {denoised.shape}")
+    stderr_sink = _tqdm_intercept if _tqdm_intercept is not None else StringIO()
+    with redirect_stderr(stderr_sink):
+        if wav.shape[-1] <= chunk_size:
+            separated = apply_model(model, wav[None], device=device, progress=True)
+            denoised = separated[0][3]
+            if VERBOSE_MODE:
+                logging.info(f"Extracted vocals stem from Demucs separation, shape: {denoised.shape}")
+        else:
+            chunks = []
+            for i in range(0, wav.shape[-1], chunk_size):
+                chunk = wav[:, i : i + chunk_size]
+                separated = apply_model(model, chunk[None], device=device, progress=True)
+                chunk_vocals = separated[0][3]
+                chunks.append(chunk_vocals.cpu())
+            denoised = torch.cat(chunks, dim=-1)
+            if VERBOSE_MODE:
+                logging.info(f"Extracted vocals stem from Demucs separation (chunked), shape: {denoised.shape}")
 
     return denoised
 
@@ -1197,28 +1426,31 @@ def _save_vocals_and_background(
         bool: Success status
     """
     try:
-        logging.info(f"DEBUG: _save_vocals_and_background called for {input_file}")
+        logging.debug(f" _save_vocals_and_background called for {input_file}")
         # Load and prepare audio
         wav, sr = _load_audio_for_demucs(input_file)
         wav = _prepare_audio_channels(wav)
-        logging.info(f"DEBUG: Audio loaded - shape: {wav.shape}, sample_rate: {sr}")
+        logging.debug(f" Audio loaded - shape: {wav.shape}, sample_rate: {sr}")
 
         # Apply model to get all stems
-        with torch.no_grad():
+        from contextlib import redirect_stderr
+        from io import StringIO
+        stderr_sink = _tqdm_intercept if _tqdm_intercept is not None else StringIO()
+        with redirect_stderr(stderr_sink), torch.no_grad():
             if device == "cuda":
                 wav = wav.to(device)
 
             # Apply Demucs separation
             chunk_size = sr * 30  # 30 second chunks
             if wav.shape[-1] <= chunk_size:
-                separated = apply_model(model, wav[None], device=device, progress=False)
+                separated = apply_model(model, wav[None], device=device, progress=True)
                 stems = separated[0]  # [drums, bass, other, vocals]
             else:
                 # Process long files in chunks
                 all_chunks = [[], [], [], []]  # For each stem
                 for i in range(0, wav.shape[-1], chunk_size):
                     chunk = wav[:, i : i + chunk_size]
-                    separated = apply_model(model, chunk[None], device=device, progress=False)
+                    separated = apply_model(model, chunk[None], device=device, progress=True)
                     chunk_stems = separated[0]
                     for stem_idx in range(4):
                         all_chunks[stem_idx].append(chunk_stems[stem_idx].cpu())
@@ -1243,9 +1475,9 @@ def _save_vocals_and_background(
         vocals_output = output_dir / f"{base_name}_vocals_raw.wav"
         background_output = output_dir / f"{base_name}_background_raw.wav"
 
-        logging.info(f"DEBUG: Saving vocals to: {vocals_output}")
+        logging.debug(f" Saving vocals to: {vocals_output}")
         _save_demucs_output(vocals_stem, vocals_output, sr)
-        logging.info(f"DEBUG: Saving background to: {background_output}")
+        logging.debug(f" Saving background to: {background_output}")
         _save_demucs_output(background_stem, background_output, sr)
 
         if VERBOSE_MODE:
@@ -1279,21 +1511,24 @@ def run_demucs_with_all_stems(
         wav = _prepare_audio_channels(wav)
 
         # Apply model
-        with torch.no_grad():
+        from contextlib import redirect_stderr
+        from io import StringIO
+        stderr_sink = _tqdm_intercept if _tqdm_intercept is not None else StringIO()
+        with redirect_stderr(stderr_sink), torch.no_grad():
             if device == "cuda":
                 wav = wav.to(device)
 
             # Apply Demucs separation and get all stems
             chunk_size = sr * 30  # 30 second chunks
             if wav.shape[-1] <= chunk_size:
-                separated = apply_model(model, wav[None], device=device, progress=False)
+                separated = apply_model(model, wav[None], device=device, progress=True)
                 stems = separated[0]  # [drums, bass, other, vocals]
             else:
                 # Process long files in chunks
                 all_chunks = [[], [], [], []]  # For each stem
                 for i in range(0, wav.shape[-1], chunk_size):
                     chunk = wav[:, i : i + chunk_size]
-                    separated = apply_model(model, chunk[None], device=device, progress=False)
+                    separated = apply_model(model, chunk[None], device=device, progress=True)
                     chunk_stems = separated[0]
                     for stem_idx in range(4):
                         all_chunks[stem_idx].append(chunk_stems[stem_idx].cpu())
@@ -1433,132 +1668,144 @@ def _process_python_restoration_pipeline(
             console.print("  [green]Step 3: Trimmed extended silences[/green]")
     return True
 
-def _process_demucs_pipeline(
-    file_path: Path,
-    output_file: Path,
-    temp_files: dict,  # Contains temp_vocals_file, temp_cleaned_file, temp_normalized_file
-    model,
-    device: str,
-    processing_config: dict,  # Contains target_lufs, enhanced_cleaning, intensive_cleanup, use_dynaudnorm, use_two_pass_loudnorm, trim_silence, silence_threshold, output_format
+def _demucs_extract_vocals(
+    file_path: Path, temp_vocals_file: Path, model, device: Optional[str], save_stems: bool,
+    separator: str = "roformer", bsr_separator=None
 ) -> bool:
-    """Handle the improved Demucs processing pipeline with post-AI cleanup."""
-    # Extract parameters from config and temp_files
-    temp_vocals_file = temp_files['temp_vocals_file']
-    temp_cleaned_file = temp_files['temp_cleaned_file']
-    temp_normalized_file = temp_files['temp_normalized_file']
+    """Extract vocals using Demucs or BS-RoFormer, optionally saving background stems."""
+    if separator in ("roformer", "mel-roformer") and bsr_separator is not None:
+        if VERBOSE_MODE:
+            logging.info(f"separator flag: {separator} (BS-RoFormer)")
+        if save_stems:
+            base_name = file_path.stem
+            output_dir = file_path.parent
+            stem_paths = run_bsroformer_stems(file_path, output_dir, base_name, bsr_separator)
+            if not stem_paths:
+                return False
+            vocals_path = stem_paths.get("vocals")
+            if vocals_path and vocals_path.exists():
+                shutil.copy2(vocals_path, temp_vocals_file)
+            if not QUIET_MODE:
+                console.print("  [green]Step 1: Extracted vocals and saved background (BS-RoFormer)[/green]")
+        else:
+            if not run_bsroformer_denoise(file_path, temp_vocals_file, bsr_separator):
+                return False
+            if not QUIET_MODE:
+                console.print("  [green]Step 1: Extracted vocals from audio (BS-RoFormer)[/green]")
+        return True
 
-    target_lufs = processing_config['target_lufs']
-    enhanced_cleaning = processing_config['enhanced_cleaning']
-    intensive_cleanup = processing_config['intensive_cleanup']
-    use_dynaudnorm = processing_config['use_dynaudnorm']
-    use_two_pass_loudnorm = processing_config['use_two_pass_loudnorm']
-    trim_silence = processing_config['trim_silence']
-    silence_threshold = processing_config['silence_threshold']
-    output_format = processing_config['output_format']
-    voice_consistent = processing_config.get('voice_consistent', False)
-
-    # Step 1: Extract vocals (and optionally all stems) using Demucs
-    save_stems = processing_config.get('save_stems', False)
-
+    # Existing Demucs logic below — unchanged
     if VERBOSE_MODE:
         logging.info(f"save_stems flag: {save_stems}")
 
     if save_stems:
-        # Save vocals and background (everything else) when requested
         base_name = file_path.stem
         output_dir = file_path.parent
-
-        # Run Demucs separation and get vocals + background
-        if _save_vocals_and_background(file_path, output_dir, base_name, model, device, temp_vocals_file):
-            if not QUIET_MODE:
-                console.print("  [green]Step 1: Extracted vocals and saved background music[/green]")
-        else:
+        if not _save_vocals_and_background(file_path, output_dir, base_name, model, device, temp_vocals_file):
             return False
+        if not QUIET_MODE:
+            console.print("  [green]Step 1: Extracted vocals and saved background music[/green]")
     else:
-        # Standard vocals-only extraction
         if not run_demucs_denoise(file_path, temp_vocals_file, model, device):
             return False
         if not QUIET_MODE:
             console.print("  [green]Step 1: Extracted vocals from audio[/green]")
-    
-    # Step 2: NEW - Post-AI cleanup to remove residual artifacts
-    if not run_post_ai_cleanup(temp_vocals_file, temp_cleaned_file, intensive_cleanup):
-        return False
-    if not QUIET_MODE:
-        console.print("  [green]Step 2: Cleaned up AI artifacts[/green]")
-    
-    # Step 3: Normalize the cleaned vocals (now using better algorithm)
-    normalize_input = temp_cleaned_file
-    normalize_output = temp_normalized_file if trim_silence else output_file
-    
+    return True
+
+
+def _demucs_normalize_audio(
+    normalize_input: Path, normalize_output: Path, config: dict
+) -> bool:
+    """Normalize audio with configured settings."""
     if not run_ffmpeg_normalize(
-        normalize_input, normalize_output, target_lufs,
-        use_dynaudnorm=use_dynaudnorm, enhanced_cleaning=enhanced_cleaning,
-        output_format=output_format, use_two_pass=use_two_pass_loudnorm,
-        voice_consistent=voice_consistent
+        normalize_input, normalize_output, config['target_lufs'],
+        use_dynaudnorm=config['use_dynaudnorm'],
+        enhanced_cleaning=config['enhanced_cleaning'],
+        output_format=config['output_format'],
+        use_two_pass=config['use_two_pass_loudnorm'],
+        voice_consistent=config.get('voice_consistent', False)
     ):
         return False
     if not QUIET_MODE:
-        method = "dynaudnorm" if use_dynaudnorm else "loudnorm"
+        method = "dynaudnorm" if config['use_dynaudnorm'] else "loudnorm"
         console.print(f"  [green]Step 3: Normalized with {method}[/green]")
-    
+    return True
+
+
+def _process_demucs_pipeline(
+    file_path: Path,
+    output_file: Path,
+    temp_files: dict,
+    model,
+    device: str,
+    processing_config: dict,
+) -> bool:
+    """Handle the improved Demucs processing pipeline with post-AI cleanup."""
+    temp_vocals_file = temp_files['temp_vocals_file']
+    temp_cleaned_file = temp_files['temp_cleaned_file']
+    temp_normalized_file = temp_files['temp_normalized_file']
+
+    # Step 1: Extract vocals
+    save_stems = processing_config.get('save_stems', False)
+    if not _demucs_extract_vocals(
+        file_path, temp_vocals_file, model, device, save_stems,
+        separator=processing_config.get('separator', 'roformer'),
+        bsr_separator=processing_config.get('bsr_separator'),
+    ):
+        return False
+
+    # Step 2: Post-AI cleanup
+    if not run_post_ai_cleanup(temp_vocals_file, temp_cleaned_file, processing_config['intensive_cleanup']):
+        return False
+    if not QUIET_MODE:
+        console.print("  [green]Step 2: Cleaned up AI artifacts[/green]")
+
+    # Step 3: Normalize
+    trim_silence = processing_config['trim_silence']
+    normalize_output = temp_normalized_file if trim_silence else output_file
+    if not _demucs_normalize_audio(temp_cleaned_file, normalize_output, processing_config):
+        return False
+
     # Step 4: Trim silences if requested
     if trim_silence:
-        if not run_silence_trimmer(temp_normalized_file, output_file, silence_threshold=silence_threshold, output_format=output_format):
+        if not run_silence_trimmer(
+            temp_normalized_file, output_file,
+            silence_threshold=processing_config['silence_threshold'],
+            output_format=processing_config['output_format']
+        ):
             return False
         if not QUIET_MODE:
             console.print("  [green]Step 4: Trimmed extended silences[/green]")
     return True
 
-def _process_speechbrain_pipeline(
-    file_path: Path,
-    output_file: Path,
-    temp_enhanced_file: Path,
-    temp_normalized_file: Path,
-    target_lufs: float,
-    enhanced_cleaning: bool,
-    use_two_pass_loudnorm: bool,
-    trim_silence: bool,
-    silence_threshold: float,
-    output_format: str,
-    save_stems: bool = False,
-    model=None,
-    device: Optional[str] = None,
-    voice_consistent: bool = False,
-) -> bool:
-    """Handle the SpeechBrain MetricGAN+ processing pipeline."""
-    logging.info(f"DEBUG: _process_speechbrain_pipeline called with save_stems={save_stems}, model={model is not None}, device={device}")
+def _speechbrain_handle_stems(file_path: Path, model, device: Optional[str], save_stems: bool) -> None:
+    """Handle stem separation for SpeechBrain pipeline if requested."""
+    if not save_stems:
+        return
 
-    # Handle save_stems request before SpeechBrain processing
-    if save_stems:
-        logging.info("DEBUG: Entering save_stems block in _process_speechbrain_pipeline")
-        if model is None or device is None:
-            logging.info(f"DEBUG: save_stems failed - model is None: {model is None}, device is None: {device is None}")
-            if not QUIET_MODE:
-                console.print("  [yellow]Warning: save_stems requires model and device parameters[/yellow]")
-        else:
-            logging.info("DEBUG: save_stems has valid model and device - proceeding with stem separation")
-            base_name = file_path.stem
-            output_dir = file_path.parent
-            temp_vocals_file = output_dir / f"{base_name}_temp_vocals.wav"
-
-            logging.info(f"DEBUG: Calling _save_vocals_and_background with base_name='{base_name}', output_dir='{output_dir}'")
-            if _save_vocals_and_background(file_path, output_dir, base_name, model, device, temp_vocals_file):
-                logging.info("DEBUG: _save_vocals_and_background returned True - stem separation succeeded")
-                if not QUIET_MODE:
-                    console.print("  [green]Saved vocals and background stems[/green]")
-            else:
-                logging.info("DEBUG: _save_vocals_and_background returned False - stem separation failed")
-
-    # Step 1: SpeechBrain MetricGAN+ enhancement
-    if not HAS_SPEECHBRAIN:
+    logging.debug(" Entering save_stems block in _process_speechbrain_pipeline")
+    if model is None or device is None:
+        logging.debug(" save_stems failed - model/device missing")
         if not QUIET_MODE:
-            console.print("  [yellow]Warning: SpeechBrain not available. Install with: pip install speechbrain[/yellow]")
-            console.print("  [blue]Falling back to standard Demucs pipeline...[/blue]")
-        return False
+            console.print("  [yellow]Warning: save_stems requires model and device parameters[/yellow]")
+        return
 
-    # Step 1: Normalize the audio first for better SpeechBrain performance
-    temp_prenorm_file = file_path.parent / f"{file_path.stem}_temp_prenorm.wav"
+    base_name = file_path.stem
+    output_dir = file_path.parent
+    temp_vocals_file = output_dir / f"{base_name}_temp_vocals.wav"
+
+    if _save_vocals_and_background(file_path, output_dir, base_name, model, device, temp_vocals_file):
+        if not QUIET_MODE:
+            console.print("  [green]Saved vocals and background stems[/green]")
+
+
+def _speechbrain_enhance_audio(
+    file_path: Path, temp_prenorm_file: Path, temp_enhanced_file: Path,
+    target_lufs: float, enhanced_cleaning: bool, use_two_pass_loudnorm: bool,
+    voice_consistent: bool
+) -> bool:
+    """Pre-normalize and enhance audio with SpeechBrain."""
+    # Step 1: Pre-normalize
     if not run_ffmpeg_normalize(
         file_path, temp_prenorm_file, target_lufs,
         enhanced_cleaning=enhanced_cleaning, use_two_pass=use_two_pass_loudnorm,
@@ -1568,41 +1815,231 @@ def _process_speechbrain_pipeline(
     if not QUIET_MODE:
         console.print("  [green]Step 1: Pre-normalized audio for optimal enhancement[/green]")
 
-    # Step 2: Enhance the normalized audio with SpeechBrain
+    # Step 2: Enhance with SpeechBrain
     if not run_speechbrain_enhance(temp_prenorm_file, temp_enhanced_file):
         if not QUIET_MODE:
-            console.print("  [yellow]SpeechBrain enhancement failed, falling back to standard pipeline[/yellow]")
-        # Clean up temp file
+            console.print("  [yellow]SpeechBrain enhancement failed[/yellow]")
         if temp_prenorm_file.exists():
             temp_prenorm_file.unlink()
         return False
     if not QUIET_MODE:
-        console.print("  [green]Step 2: Enhanced pre-normalized audio with SpeechBrain MetricGAN+[/green]")
+        console.print("  [green]Step 2: Enhanced with SpeechBrain MetricGAN+[/green]")
 
-    # Clean up intermediate file
+    # Cleanup prenorm file
     if temp_prenorm_file.exists():
         temp_prenorm_file.unlink()
+    return True
 
-    # Step 3: Final output preparation
+
+def _process_speechbrain_pipeline(
+    file_path: Path,
+    output_file: Path,
+    temp_files: dict,
+    processing_config: dict,
+    model=None,
+    device: Optional[str] = None,
+) -> bool:
+    """Handle the SpeechBrain MetricGAN+ processing pipeline.
+
+    Args:
+        file_path: Input audio file
+        output_file: Output file path
+        temp_files: Dict with temp_enhanced_file, temp_normalized_file
+        processing_config: Dict with target_lufs, enhanced_cleaning, use_two_pass_loudnorm,
+                          trim_silence, silence_threshold, output_format, save_stems, voice_consistent
+        model: Optional Demucs model for stem separation
+        device: Optional device for model
+    """
+    # Extract config
+    save_stems = processing_config.get('save_stems', False)
+    trim_silence = processing_config.get('trim_silence', False)
+    temp_enhanced_file = temp_files['temp_enhanced_file']
+    temp_normalized_file = temp_files['temp_normalized_file']
+
+    # Handle optional stem separation
+    _speechbrain_handle_stems(file_path, model, device, save_stems)
+
+    # Check SpeechBrain availability
+    if not HAS_SPEECHBRAIN:
+        if not QUIET_MODE:
+            console.print("  [yellow]Warning: SpeechBrain not available[/yellow]")
+        return False
+
+    # Enhance audio
+    temp_prenorm_file = file_path.parent / f"{file_path.stem}_temp_prenorm.wav"
+    if not _speechbrain_enhance_audio(
+        file_path, temp_prenorm_file, temp_enhanced_file,
+        processing_config['target_lufs'],
+        processing_config.get('enhanced_cleaning', False),
+        processing_config.get('use_two_pass_loudnorm', False),
+        processing_config.get('voice_consistent', False)
+    ):
+        return False
+
+    # Step 3: Copy to output location
     normalize_output = temp_normalized_file if trim_silence else output_file
-    # Copy enhanced file to final output location (may need light post-processing)
     if temp_enhanced_file != normalize_output:
         try:
             shutil.copy2(temp_enhanced_file, normalize_output)
-        except (OSError, PermissionError) as e:
+        except OSError as e:
             logging.error(f"Failed to copy enhanced file: {e}")
             return False
     if not QUIET_MODE:
         console.print("  [green]Step 3: Prepared final enhanced audio[/green]")
 
-    # Step 3: Apply silence trimming if requested
+    # Step 4: Apply silence trimming if requested
     if trim_silence:
-        if not run_silence_trimmer(temp_normalized_file, output_file, silence_threshold=silence_threshold, output_format=output_format):
+        if not run_silence_trimmer(
+            temp_normalized_file, output_file,
+            silence_threshold=processing_config.get('silence_threshold', -30.0),
+            output_format=processing_config.get('output_format', 'wav')
+        ):
             return False
         if not QUIET_MODE:
-            console.print("  [green]Step 3: Trimmed extended silences[/green]")
+            console.print("  [green]Step 4: Trimmed extended silences[/green]")
 
     return True
+
+
+def _determine_output_file(
+    file_path: Path, config: AudioProcessingConfig
+) -> tuple[Optional[Path], Optional[str]]:
+    """Determine output filename based on processing config.
+
+    Returns:
+        tuple: (output_file, skip_reason) - skip_reason is set if file should be skipped
+    """
+    base = file_path.with_suffix("")
+
+    if config.stems_only:
+        vocals_file = base.with_name(base.name + "_vocals.wav")
+        background_file = base.with_name(base.name + "_background.wav")
+        if vocals_file.exists() and background_file.exists() and not config.overwrite:
+            return None, "stems already exist"
+        return None, None  # No single output file for stems-only
+
+    if config.speechbrain_enhance:
+        suffix = f"_speechbrain_enhanced.{config.output_format}"
+    elif config.skip_demucs:
+        suffix = f"_normalized.{config.output_format}"
+    elif config.python_restoration:
+        suffix = f"_restored_normalized.{config.output_format}"
+    else:
+        suffix = f"_voice_normalized.{config.output_format}"
+
+    output_file = base.with_name(base.name + suffix)
+
+    if output_file.exists() and not config.overwrite:
+        return output_file, "output exists"
+
+    return output_file, None
+
+
+def _process_stems_only(file_path: Path, model, device: str, separator: str = "roformer", bsr_separator=None) -> str:
+    """Process file in stems-only mode."""
+    logging.debug(" Entering stems-only pipeline")
+
+    if separator in ("roformer", "mel-roformer") and bsr_separator is not None:
+        base_name = file_path.stem
+        output_dir = file_path.parent
+        stem_paths = run_bsroformer_stems(file_path, output_dir, base_name, bsr_separator)
+        if not stem_paths:
+            logging.error("BS-RoFormer stems separation failed")
+            return ProcessingResult.FAILED
+        if not QUIET_MODE:
+            console.print(f"  [green]Stems-only: Saved {base_name}_vocals.wav and {base_name}_background.wav (BS-RoFormer)[/green]")
+        return ProcessingResult.SUCCESS
+    # Existing Demucs logic below — unchanged
+
+    if model is None or device is None:
+        logging.error("Stems-only mode requires Demucs model - loading model")
+        model, device = load_demucs_model('htdemucs_ft')
+
+    base_name = file_path.stem
+    output_dir = file_path.parent
+
+    stem_paths = run_demucs_with_all_stems(file_path, output_dir, base_name, model, device)
+
+    if not stem_paths or "vocals" not in stem_paths or "other" not in stem_paths:
+        logging.error("Stems separation failed")
+        return ProcessingResult.FAILED
+
+    # Create combined background
+    background_path = output_dir / f"{base_name}_background.wav"
+    try:
+        drums_wav, sr = _load_audio_for_demucs(stem_paths.get("drums", stem_paths["other"]))
+        bass_wav, _ = _load_audio_for_demucs(stem_paths.get("bass", stem_paths["other"]))
+        other_wav, _ = _load_audio_for_demucs(stem_paths["other"])
+
+        background_combined = drums_wav + bass_wav + other_wav
+        background_mono = _convert_to_mono(background_combined)
+        _save_demucs_output(background_mono, background_path, sr)
+
+        if not QUIET_MODE:
+            console.print(f"  [green]Stems-only: Saved {base_name}_vocals.wav and {base_name}_background.wav[/green]")
+        return ProcessingResult.SUCCESS
+    except Exception as e:
+        logging.error(f"Failed to combine background stems: {e}")
+        if not QUIET_MODE:
+            console.print("  [green]Stems-only: Saved individual stems only[/green]")
+        return ProcessingResult.SUCCESS
+
+
+def _run_main_pipeline(
+    file_path: Path,
+    output_file: Path,
+    temp_files: dict,
+    config: AudioProcessingConfig,
+    model,
+    device: Optional[str]
+) -> str:
+    """Run the appropriate processing pipeline based on config."""
+    processing_config = config.to_dict()
+
+    if config.speechbrain_enhance:
+        sb_temp_files = {
+            'temp_enhanced_file': temp_files['temp_enhanced_file'],
+            'temp_normalized_file': temp_files['temp_normalized_file']
+        }
+        if _process_speechbrain_pipeline(
+            file_path, output_file, sb_temp_files, processing_config, model, device
+        ):
+            return ProcessingResult.SUCCESS
+
+        # Fallback to Demucs
+        if not QUIET_MODE:
+            console.print("  [blue]Falling back to Demucs pipeline...[/blue]")
+
+    if config.skip_demucs:
+        if not _process_skip_demucs_pipeline(
+            file_path, output_file, temp_files['temp_normalized_file'],
+            config.target_lufs, config.enhanced_cleaning, config.use_two_pass_loudnorm,
+            config.trim_silence, config.silence_threshold, config.output_format,
+            config.voice_consistent
+        ):
+            return ProcessingResult.FAILED
+    elif config.python_restoration:
+        if not _process_python_restoration_pipeline(
+            file_path, output_file, temp_files['temp_vocals_file'],
+            temp_files['temp_normalized_file'], config.target_lufs,
+            config.enhanced_cleaning, config.use_two_pass_loudnorm,
+            config.trim_silence, config.silence_threshold, config.output_format,
+            config.voice_consistent
+        ):
+            return ProcessingResult.FAILED
+    else:
+        demucs_temp_files = {
+            'temp_vocals_file': temp_files['temp_vocals_file'],
+            'temp_cleaned_file': temp_files['temp_cleaned_file'],
+            'temp_normalized_file': temp_files['temp_normalized_file']
+        }
+        if not _process_demucs_pipeline(
+            file_path, output_file, demucs_temp_files, model, device, processing_config
+        ):
+            return ProcessingResult.FAILED
+
+    return ProcessingResult.SUCCESS
+
 
 def process_file_with_model(
     file_path: Path,
@@ -1624,7 +2061,9 @@ def process_file_with_model(
     overwrite: bool = False,
     output_format: str = "wav",
     voice_consistent: bool = False,
-) -> bool:
+    separator: str = "roformer",
+    bsr_separator=None,
+) -> str:
     """Process a single audio file through the improved voice-first pipeline.
 
     IMPROVED PIPELINE ORDER:
@@ -1647,19 +2086,20 @@ def process_file_with_model(
         trim_silence: Enable silence trimming after processing
         intensive_cleanup: Enable more aggressive post-AI artifact removal
         use_dynaudnorm: Use dynaudnorm instead of loudnorm (recommended)
-        voice_consistent: Use voice-consistent normalization for uniform voice levels throughout audio
+        voice_consistent: Use voice-consistent normalization for uniform voice levels
 
     Returns:
-        bool: Success status
+        str: ProcessingResult.SUCCESS, ProcessingResult.SKIPPED, or ProcessingResult.FAILED
     """
-    logging.info(f"DEBUG: audionorm.py process_file_with_model called with save_stems={save_stems}, speechbrain_enhance={speechbrain_enhance}")
-    if not file_path.exists():
-        logging.error(f"Input file not found: {file_path}")
-        return False
+    logging.debug(f" process_file_with_model called with save_stems={save_stems}")
 
-    if file_path.suffix.lower() not in [".wav", ".mp3", ".flac", ".m4a", ".ogg"]:
-        logging.warning(f"Unsupported file format: {file_path.suffix}")
-        return False
+    # Validate input file before processing
+    is_valid, error_msg = validate_audio_file(file_path, check_duration=False)
+    if not is_valid:
+        logging.error(f"Validation failed for {file_path}: {error_msg}")
+        if not QUIET_MODE:
+            console.print(f"[red]Error: {error_msg}[/red]")
+        return ProcessingResult.FAILED
 
     base = file_path.with_suffix("")
     temp_vocals_file = base.with_name(base.name + "_temp_vocals.wav")
@@ -1676,7 +2116,7 @@ def process_file_with_model(
         if vocals_file.exists() and background_file.exists() and not overwrite:
             if not QUIET_MODE:
                 console.print(f"[yellow]Skipping {file_path.name} (stems already exist, use --overwrite to replace)[/yellow]")
-            return "skipped"
+            return ProcessingResult.SKIPPED
         output_file = None  # No single output file for stems-only mode
     elif speechbrain_enhance:
         suffix = f"_speechbrain_enhanced.{output_format}"
@@ -1695,7 +2135,7 @@ def process_file_with_model(
     if not stems_only and output_file.exists() and not overwrite:
         if not QUIET_MODE:
             console.print(f"[yellow]Skipping {file_path.name} (output exists, use --overwrite to replace)[/yellow]")
-        return "skipped"
+        return ProcessingResult.SKIPPED
 
     try:
         # PIPELINE SELECTION: Choose the best enhancement method
@@ -1704,13 +2144,16 @@ def process_file_with_model(
             logging.info(f"Pipeline selection - speechbrain_enhance: {speechbrain_enhance}, skip_demucs: {skip_demucs}, python_restoration: {python_restoration}, save_stems: {save_stems}, stems_only: {stems_only}")
             logging.info(f"Model and device status: model={model is not None}, device={device}")
             if save_stems:
-                logging.info("DEBUG: save_stems=True - will attempt stem separation")
+                logging.debug(" save_stems=True - will attempt stem separation")
             if stems_only:
-                logging.info("DEBUG: stems_only=True - will only separate stems without processing")
+                logging.debug(" stems_only=True - will only separate stems without processing")
 
         if stems_only:
             # STEMS-ONLY MODE: Only separate vocals and background, no processing
-            logging.info("DEBUG: Entering stems-only pipeline")
+            logging.debug(" Entering stems-only pipeline")
+            if separator in ("roformer", "mel-roformer") and bsr_separator is not None:
+                return _process_stems_only(file_path, model, device, separator=separator, bsr_separator=bsr_separator)
+            # Existing Demucs stems-only logic below (unchanged)
             if model is None or device is None:
                 logging.error("Stems-only mode requires Demucs model - loading model")
                 model, device = load_demucs_model('htdemucs_ft')
@@ -1740,27 +2183,39 @@ def process_file_with_model(
                         console.print(f"  [green]Stems-only: Saved {base_name}_vocals.wav and {base_name}_background.wav[/green]")
                         console.print("  [green]Stems-only: Also saved individual stems (drums, bass, other)[/green]")
 
-                    return True
+                    return ProcessingResult.SUCCESS
                 except Exception as e:
                     logging.error(f"Failed to combine background stems: {e}")
                     if not QUIET_MODE:
                         console.print("  [green]Stems-only: Saved individual stems only[/green]")
-                    return True
+                    return ProcessingResult.SUCCESS
             else:
                 logging.error("Stems separation failed")
-                return False
+                return ProcessingResult.FAILED
         elif speechbrain_enhance:
-            logging.info("DEBUG: Entering SpeechBrain pipeline block")
+            logging.debug(" Entering SpeechBrain pipeline block")
+            # Build config dicts for SpeechBrain pipeline
+            sb_temp_files = {
+                'temp_enhanced_file': temp_enhanced_file,
+                'temp_normalized_file': temp_normalized_file
+            }
+            sb_config = {
+                'target_lufs': target_lufs,
+                'enhanced_cleaning': enhanced_cleaning,
+                'use_two_pass_loudnorm': use_two_pass_loudnorm,
+                'trim_silence': trim_silence,
+                'silence_threshold': silence_threshold,
+                'output_format': output_format,
+                'save_stems': save_stems,
+                'voice_consistent': voice_consistent
+            }
             # Try SpeechBrain first, fallback to Demucs if it fails
             if _process_speechbrain_pipeline(
-                file_path, output_file, temp_enhanced_file, temp_normalized_file,
-                target_lufs, enhanced_cleaning, use_two_pass_loudnorm, trim_silence,
-                silence_threshold, output_format, save_stems, model, device, voice_consistent
+                file_path, output_file, sb_temp_files, sb_config, model, device
             ):
-                logging.info("DEBUG: SpeechBrain pipeline completed successfully")
-                pass  # SpeechBrain pipeline completed successfully
+                logging.debug(" SpeechBrain pipeline completed successfully")
             else:
-                logging.info("DEBUG: SpeechBrain pipeline failed, falling back to Demucs")
+                logging.debug(" SpeechBrain pipeline failed, falling back to Demucs")
                 # Fallback to Demucs pipeline
                 if not QUIET_MODE:
                     console.print("  [blue]Falling back to Demucs pipeline...[/blue]")
@@ -1779,26 +2234,28 @@ def process_file_with_model(
                     'silence_threshold': silence_threshold,
                     'output_format': output_format,
                     'save_stems': save_stems,
-                    'voice_consistent': voice_consistent
+                    'voice_consistent': voice_consistent,
+                    'separator': separator,
+                    'bsr_separator': bsr_separator,
                 }
                 if not _process_demucs_pipeline(
                     file_path, output_file, temp_files_dict, model, device, processing_config_dict
                 ):
-                    return False
+                    return ProcessingResult.FAILED
         elif skip_demucs:
             if not _process_skip_demucs_pipeline(
                 file_path, output_file, temp_normalized_file, target_lufs,
                 enhanced_cleaning, use_two_pass_loudnorm, trim_silence, silence_threshold, output_format,
                 voice_consistent
             ):
-                return False
+                return ProcessingResult.FAILED
         elif python_restoration:
             if not _process_python_restoration_pipeline(
                 file_path, output_file, temp_vocals_file, temp_normalized_file,
                 target_lufs, enhanced_cleaning, use_two_pass_loudnorm, trim_silence, silence_threshold, output_format,
                 voice_consistent
             ):
-                return False
+                return ProcessingResult.FAILED
         else:
             temp_files_dict = {
                 'temp_vocals_file': temp_vocals_file,
@@ -1815,12 +2272,14 @@ def process_file_with_model(
                 'silence_threshold': silence_threshold,
                 'output_format': output_format,
                 'save_stems': save_stems,
-                'voice_consistent': voice_consistent
+                'voice_consistent': voice_consistent,
+                'separator': separator,
+                'bsr_separator': bsr_separator,
             }
             if not _process_demucs_pipeline(
                 file_path, output_file, temp_files_dict, model, device, processing_config_dict
             ):
-                return False
+                return ProcessingResult.FAILED
 
         # Cleanup temporary files unless debugging
         if not keep_temp:
@@ -1836,31 +2295,34 @@ def process_file_with_model(
         else:
             if not output_file.exists():
                 logging.error(f"Output file was not created: {output_file}")
-                return False
+                return ProcessingResult.FAILED
 
             file_size_mb = output_file.stat().st_size / (1024 * 1024)
             if not QUIET_MODE:
                 console.print(f"  [green]Complete: {output_file.name} ({file_size_mb:.1f}MB)[/green]")
-        return True
+        return ProcessingResult.SUCCESS
     except Exception as e:
         logging.error(f"Processing failed for {file_path}: {e}")
         # Cleanup on failure
-        for temp_file in [temp_vocals_file, temp_cleaned_file, temp_enhanced_file, temp_normalized_file, temp_silence_trimmed_file, output_file]:
-            if temp_file.exists():
-                temp_file.unlink()
-        return False
+        files_to_cleanup = [
+            temp_vocals_file, temp_cleaned_file, temp_enhanced_file,
+            temp_normalized_file, temp_silence_trimmed_file
+        ]
+        if output_file:
+            files_to_cleanup.append(output_file)
+        cleanup_temp_files(*files_to_cleanup)
+        return ProcessingResult.FAILED
 
 def find_audio_files(path: Path, recursive: bool = False) -> List[Path]:
     """Find audio files in the given path."""
-    extensions = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
     audio_files = []
 
     if path.is_file():
-        if path.suffix.lower() in extensions:
+        if path.suffix.lower() in SUPPORTED_AUDIO_FORMATS:
             audio_files.append(path)
     elif path.is_dir():
         pattern = "**/*" if recursive else "*"
-        for ext in extensions:
+        for ext in SUPPORTED_AUDIO_FORMATS:
             audio_files.extend(path.glob(f"{pattern}{ext}"))
             audio_files.extend(path.glob(f"{pattern}{ext.upper()}"))
 
@@ -1880,22 +2342,33 @@ def process_files_with_progress(audio_files: List[Path], **kwargs) -> tuple[int,
     skip_demucs = kwargs.get('skip_demucs', False)
     python_restoration = kwargs.get('python_restoration', False)
     
-    # Load Demucs model once if needed
-    model = None
-    device = None
+    # Load model once (Demucs or BS-RoFormer) based on separator selection
     save_stems = kwargs.get('save_stems', False)
     stems_only = kwargs.get('stems_only', False)
-    if (not skip_demucs and not python_restoration) or save_stems or stems_only:
-        if save_stems:
-            logging.info("DEBUG: Loading Demucs model because save_stems=True")
-        elif stems_only:
-            logging.info("DEBUG: Loading Demucs model because stems_only=True")
-        model, device = load_demucs_model(kwargs.get('model_name', 'htdemucs_ft'), kwargs.get('device'))
-        kwargs['model'] = model
-        kwargs['device'] = device
-        logging.info(f"DEBUG: Model loaded - model={model is not None}, device={device}")
+    separator = kwargs.get('separator', 'roformer')
+    bsr_separator = None
+    model = None
+    device = None
+
+    if separator in ('roformer', 'mel-roformer'):
+        bsr_separator = load_bsroformer_separator(separator)
+        if bsr_separator is None:
+            if not QUIET_MODE:
+                console.print("  [yellow]Warning: BS-RoFormer unavailable, falling back to Demucs[/yellow]")
+            if (not skip_demucs and not python_restoration) or save_stems or stems_only:
+                model, device = load_demucs_model(kwargs.get('model_name', 'htdemucs_ft'), kwargs.get('device'))
     else:
-        logging.info(f"DEBUG: Skipping model load - skip_demucs={skip_demucs}, python_restoration={python_restoration}, save_stems={save_stems}, stems_only={stems_only}")
+        if (not skip_demucs and not python_restoration) or save_stems or stems_only:
+            if save_stems:
+                logging.debug(" Loading Demucs model because save_stems=True")
+            elif stems_only:
+                logging.debug(" Loading Demucs model because stems_only=True")
+            model, device = load_demucs_model(kwargs.get('model_name', 'htdemucs_ft'), kwargs.get('device'))
+            logging.debug(f" Model loaded - model={model is not None}, device={device}")
+
+    kwargs['model'] = model
+    kwargs['device'] = device
+    kwargs['bsr_separator'] = bsr_separator
     
     if QUIET_MODE:
         # Minimal output mode
@@ -1903,10 +2376,10 @@ def process_files_with_progress(audio_files: List[Path], **kwargs) -> tuple[int,
             # Create clean kwargs for process_file_with_model
             process_kwargs = {k: v for k, v in kwargs.items() if k != 'model_name'}
             result = process_file_with_model(file_path, **process_kwargs)
-            if result == "skipped":
+            if result == ProcessingResult.SKIPPED:
                 skipped_count += 1
                 console.print(f"Skipped: {file_path.name} (output exists)")
-            elif result:
+            elif result == ProcessingResult.SUCCESS:
                 success_count += 1
                 console.print(f"Complete: {file_path.name}")
             else:
@@ -1951,21 +2424,20 @@ def process_files_with_progress(audio_files: List[Path], **kwargs) -> tuple[int,
                 progress.update(file_task, completed=10, stage="Voice: Starting")
                 
                 # Process the file
-                # Create clean kwargs for process_single_file_with_progress  
+                # Create clean kwargs for process_single_file_with_progress
                 process_kwargs = {k: v for k, v in kwargs.items() if k != 'model_name'}
                 result = process_single_file_with_progress(file_path, progress, file_task, **process_kwargs)
-                
-                if result == "skipped":
+
+                if result == ProcessingResult.SKIPPED:
                     skipped_count += 1
                     progress.update(file_task, completed=100, stage="Skipped")
-                elif result:
+                elif result == ProcessingResult.SUCCESS:
                     success_count += 1
                     progress.update(file_task, completed=100, stage="Complete")
                 else:
                     progress.update(file_task, completed=100, stage="Failed")
                 
                 # Small delay to show progress
-                import time
                 time.sleep(0.1)
                 
                 # Remove individual file task after completion
@@ -1982,174 +2454,56 @@ def process_files_with_progress(audio_files: List[Path], **kwargs) -> tuple[int,
     
     return success_count, skipped_count
 
-def process_single_file_with_progress(file_path: Path, progress, task_id, **kwargs) -> bool:
-    """Process a single file with progress updates using voice-first pipeline."""
-    try:
-        progress.update(task_id, completed=10, stage="Starting")
+def process_single_file_with_progress(file_path: Path, progress, task_id, **kwargs) -> str:
+    """Process a single file with progress updates using voice-first pipeline.
 
-        # Call the main processing function with all the pipeline logic
-        result = process_file_with_model(file_path, **kwargs)
+    Returns:
+        str: ProcessingResult.SUCCESS, ProcessingResult.SKIPPED, or ProcessingResult.FAILED
+    """
+    global _tqdm_intercept
+    result_holder = [None]
+    error_holder = [None]
 
-        if result:
-            progress.update(task_id, completed=100, stage="Complete")
-        else:
-            progress.update(task_id, completed=100, stage="Failed")
+    separator = kwargs.get('separator', 'roformer')
+    if separator in ('roformer', 'mel-roformer'):
+        expected_cycles = 1
+    else:
+        model = kwargs.get('model')
+        expected_cycles = len(model.models) if (model is not None and hasattr(model, 'models')) else 1
 
-        return result
+    interceptor = _TqdmInterceptor(expected_cycles=expected_cycles)
+    _tqdm_intercept = interceptor
 
-    except Exception as e:
+    def _run():
+        try:
+            result_holder[0] = process_file_with_model(file_path, **kwargs)
+        except Exception as e:
+            error_holder[0] = e
+            result_holder[0] = ProcessingResult.FAILED
+
+    progress.update(task_id, completed=10, stage="Separating...")
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+
+    while worker.is_alive():
+        display_pct = 10 + int(interceptor.display_pct * 0.85)
+        progress.update(task_id, completed=display_pct, stage="Separating")
+        worker.join(timeout=0.25)
+
+    _tqdm_intercept = None
+    result = result_holder[0]
+    if error_holder[0] is not None and VERBOSE_MODE:
+        logging.error(f"Error processing {file_path}: {error_holder[0]}")
+
+    if result == ProcessingResult.SUCCESS:
+        progress.update(task_id, completed=100, stage="Complete")
+    elif result == ProcessingResult.SKIPPED:
+        progress.update(task_id, completed=100, stage="Skipped")
+    else:
         progress.update(task_id, completed=100, stage="Failed")
-        if VERBOSE_MODE:
-            logging.error(f"Error processing {file_path}: {e}")
-        return False
 
+    return result if result is not None else ProcessingResult.FAILED
 
-def _process_single_file_with_progress_old(file_path: Path, progress, task_id, **kwargs) -> bool:
-    """OLD IMPLEMENTATION - Process a single file with progress updates using voice-first pipeline."""
-    try:
-        # Check if output already exists
-        base = file_path.with_suffix("")
-        skip_demucs = kwargs.get('skip_demucs', False)
-        python_restoration = kwargs.get('python_restoration', False)
-        output_format = kwargs.get('output_format', 'wav')
-
-        # Choose output filename based on processing type and format
-        if kwargs.get('speechbrain_enhance', False):
-            suffix = f"_speechbrain_enhanced.{output_format}"
-        elif skip_demucs:
-            suffix = f"_normalized.{output_format}"
-        elif python_restoration:
-            suffix = f"_restored_normalized.{output_format}"
-        else:
-            suffix = f"_voice_normalized.{output_format}"  # Updated to match new naming
-        
-        output_file = base.with_name(base.name + suffix)
-        
-        if output_file.exists() and not kwargs.get('overwrite', False):
-            progress.update(task_id, completed=100, stage="Skipped (exists)")
-            return "skipped"
-        
-        # NEW PIPELINE: Voice extraction first, then normalization
-        temp_vocals_file = base.with_name(base.name + "_temp_vocals.wav")
-        temp_normalized_file = base.with_name(base.name + "_temp_normalized.wav")
-        
-        if skip_demucs:
-            # Stage 1: Direct normalization (20-80% or 20-90% if no silence trimming)
-            progress.update(task_id, completed=30, stage="Normalizing")
-            
-            # Determine output file based on silence trimming
-            trim_silence = kwargs.get('trim_silence', False)
-            normalize_output = temp_normalized_file if trim_silence else output_file
-            
-            if not run_ffmpeg_normalize(
-                file_path, normalize_output,
-                kwargs.get('target_lufs', -18.0),
-                enhanced_cleaning=kwargs.get('enhanced_cleaning', False),
-                use_two_pass=kwargs.get('use_two_pass_loudnorm', False)
-            ):
-                progress.update(task_id, completed=100, stage="Failed: Norm Failed")
-                return False
-            
-            if trim_silence:
-                progress.update(task_id, completed=70, stage="Normalized")
-                # Stage 2: Trim silences (70-90%)
-                progress.update(task_id, completed=80, stage="Trimming Silence")
-                if not run_silence_trimmer(temp_normalized_file, output_file, silence_threshold=kwargs.get('silence_threshold', -30.0), output_format=output_format):
-                    progress.update(task_id, completed=100, stage="Failed: Silence Failed")
-                    return False
-                progress.update(task_id, completed=90, stage="Silence Trimmed")
-            else:
-                progress.update(task_id, completed=90, stage="Normalized")
-        elif python_restoration:
-            # Stage 1: Python restoration (20-60%)
-            progress.update(task_id, completed=30, stage="Restoring")
-            if not python_audio_restoration(file_path, temp_vocals_file):
-                progress.update(task_id, completed=100, stage="Failed: Restore Failed")
-                return False
-            progress.update(task_id, completed=60, stage="Restored")
-            # Stage 2: Normalize restored audio (60-90%)
-            progress.update(task_id, completed=70, stage="Normalizing")
-            if not run_ffmpeg_normalize(
-                temp_vocals_file, output_file,
-                kwargs.get('target_lufs', -18.0),
-                enhanced_cleaning=kwargs.get('enhanced_cleaning', False),
-                use_two_pass=kwargs.get('use_two_pass_loudnorm', False)
-            ):
-                progress.update(task_id, completed=100, stage="Failed: Norm Failed")
-                return False
-            progress.update(task_id, completed=90, stage="Complete")
-        else:
-            # NEW PIPELINE: Voice first, then normalize
-            # Stage 1: Extract vocals (20-60%)
-            progress.update(task_id, completed=30, stage="Extracting Voice")
-            if not run_demucs_denoise(
-                file_path, temp_vocals_file, 
-                kwargs.get('model'),
-                kwargs.get('device')
-            ):
-                progress.update(task_id, completed=100, stage="Failed: Voice Failed")
-                return False
-            progress.update(task_id, completed=60, stage="Voice Extracted")
-            
-            # Stage 2: NEW - Post-AI cleanup (60-70%)
-            temp_cleaned_file = base.with_name(base.name + "_temp_cleaned.wav")
-            progress.update(task_id, completed=65, stage="Cleaning Artifacts")
-            
-            if not run_post_ai_cleanup(
-                temp_vocals_file, temp_cleaned_file, 
-                kwargs.get('intensive_cleanup', True)
-            ):
-                progress.update(task_id, completed=100, stage="Failed: Cleanup Failed")
-                return False
-            progress.update(task_id, completed=70, stage="Artifacts Cleaned")
-            
-            # Stage 3: Normalize cleaned voice (70-85% or 70-90% if no silence trimming)
-            progress.update(task_id, completed=75, stage="Normalizing Voice")
-            
-            # Determine output file based on silence trimming
-            trim_silence = kwargs.get('trim_silence', False)
-            normalize_output = temp_normalized_file if trim_silence else output_file
-            
-            if not run_ffmpeg_normalize(
-                temp_cleaned_file, normalize_output,
-                kwargs.get('target_lufs', -18.0),
-                use_dynaudnorm=kwargs.get('use_dynaudnorm', True),
-                enhanced_cleaning=kwargs.get('enhanced_cleaning', False),
-                use_two_pass=kwargs.get('use_two_pass_loudnorm', False)
-            ):
-                progress.update(task_id, completed=100, stage="Failed: Norm Failed")
-                return False
-            
-            if trim_silence:
-                progress.update(task_id, completed=85, stage="Voice Normalized")
-                # Stage 4: Trim silences (85-90%)
-                progress.update(task_id, completed=87, stage="Trimming Silence")
-                if not run_silence_trimmer(temp_normalized_file, output_file, silence_threshold=kwargs.get('silence_threshold', -30.0), output_format=output_format):
-                    progress.update(task_id, completed=100, stage="Failed: Silence Failed")
-                    return False
-                progress.update(task_id, completed=90, stage="Silence Trimmed")
-            else:
-                progress.update(task_id, completed=90, stage="Voice Normalized")
-        
-        # Cleanup
-        if not kwargs.get('keep_temp', False):
-            for temp_file in [temp_vocals_file, temp_cleaned_file, temp_normalized_file]:
-                if temp_file.exists():
-                    temp_file.unlink()
-        
-        # Verify output
-        if not output_file.exists():
-            progress.update(task_id, completed=100, stage="Failed: No Output")
-            return False
-        
-        progress.update(task_id, completed=95, stage="Verifying")
-        return True
-        
-    except Exception as e:
-        progress.update(task_id, completed=100, stage="Failed: Error")
-        if not QUIET_MODE:
-            console.print(f"[red]Error processing {file_path}: {e}[/red]")
-        return False
 
 def main():
     global QUIET_MODE, VERBOSE_MODE
@@ -2281,6 +2635,17 @@ Examples:
         action="store_true",
         help="Use voice-consistent normalization for uniform voice levels throughout audio (fixes level variations)"
     )
+    parser.add_argument(
+        "--separator",
+        choices=["demucs", "roformer", "mel-roformer"],
+        default="roformer",
+        help=(
+            "Vocal separator: roformer (default, BS-RoFormer SDR 12.97), demucs, "
+            "or mel-roformer (Mel-Band-RoFormer, SDR 11.4). "
+            "roformer/mel-roformer require: pip install audio-separator. "
+            "--save-stems and --stems-only produce vocals + background (2 stems, not 4)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2339,6 +2704,7 @@ Examples:
         overwrite=args.overwrite,
         output_format=args.format,
         voice_consistent=args.voice_consistent,
+        separator=args.separator,
     )
 
     # Summary
@@ -2373,17 +2739,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    import atexit
-    import os
-
-    # Suppress any logging during exit cleanup if not in verbose mode
-    def suppress_exit_logs():
-        if not VERBOSE_MODE:
-            # Redirect stderr to devnull during cleanup
-            try:
-                sys.stderr = open(os.devnull, 'w')
-            except:
-                pass
-
-    atexit.register(suppress_exit_logs)
     main()

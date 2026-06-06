@@ -1,6 +1,6 @@
 # Core audio processing dependencies
-torch>=2.8.0,<3.0.0
-torchaudio>=2.8.0,<3.0.0
+torch>=2.12.0,<3.0.0
+torchaudio>=2.11.0,<3.0.0
 demucs>=4.0.1,<5.0.0
 
 # SpeechBrain for voice enhancement
@@ -21,5 +21,10 @@ rich>=14.0.0,<15.0.0
 # Transcription dependencies
 faster-whisper>=1.2.0,<2.0.0
 
-# Optional dependencies for additional formats
-# pip install ffmpeg-python  # For additional audio format support
+# Vocal separation - BS-RoFormer (default, SDR 12.97) and Mel-RoFormer (SDR 11.4)
+audio-separator>=0.44.2,<1.0.0
+
+# ONNX Runtime - GPU version enables CUDA acceleration for audio-separator and faster-whisper
+# Replaces the CPU-only onnxruntime package pulled in by faster-whisper
+# If onnxruntime (CPU) is already installed: pip uninstall onnxruntime -y
+onnxruntime-gpu>=1.20.0,<2.0.0
