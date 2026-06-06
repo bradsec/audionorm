@@ -93,15 +93,10 @@ python audioscribe.py --help
 ### AudioNorm Examples
 
 ```bash
-usage: audionorm.py [-h] [--target-lufs TARGET_LUFS] [--model MODEL]
-                    [--device {cpu,cuda}] [--recursive] [--keep-temp]
-                    [--skip-demucs] [--enhanced-cleaning] [--basic-cleaning]
-                    [--python-restoration] [--verbose] [--quiet]
-                    [--trim-silence] [--silence-threshold SILENCE_THRESHOLD]
-                    [--intensive-cleanup] [--use-loudnorm] [--overwrite]
-                    [--format {wav,mp3}] [--two-pass-loudnorm]
-                    [--single-pass-loudnorm] [--no-speechbrain] [--save-stems]
-                    [--stems-only] [--voice-consistent]
+usage: audionorm.py [-h] [--target-lufs TARGET_LUFS] [--model MODEL] [--device {cpu,cuda}] [--recursive] [--keep-temp] [--skip-demucs] [--enhanced-cleaning]
+                    [--basic-cleaning] [--python-restoration] [--verbose] [--quiet] [--trim-silence] [--silence-threshold SILENCE_THRESHOLD]
+                    [--intensive-cleanup] [--use-loudnorm] [--overwrite] [--format {wav,mp3}] [--two-pass-loudnorm] [--single-pass-loudnorm]
+                    [--no-speechbrain] [--save-stems] [--stems-only] [--voice-consistent] [--separator {demucs,roformer,mel-roformer}]
                     input
 
 Audio normalization and cleanup for TTS-generated audio
@@ -112,53 +107,41 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --target-lufs TARGET_LUFS
-                        Target loudness in LUFS (default: -18.0 optimized for
-                        voice content)
-  --model MODEL         Demucs model (default: htdemucs_ft for better vocal
-                        separation)
+                        Target loudness in LUFS (default: -18.0 optimized for voice content)
+  --model MODEL         Demucs model (default: htdemucs_ft for better vocal separation)
   --device {cpu,cuda}   Processing device (auto-detect if not specified)
   --recursive, -r       Process directories recursively
   --keep-temp           Keep temporary files for debugging
   --skip-demucs         Skip Demucs denoising (FFmpeg normalization only)
   --enhanced-cleaning   Enable enhanced FFmpeg cleaning (gentle)
   --basic-cleaning      Use basic cleaning only (faster processing)
-  --python-restoration  Use Python-based restoration (librosa + noisereduce)
-                        instead of Demucs
+  --python-restoration  Use Python-based restoration (librosa + noisereduce) instead of Demucs
   --verbose, -v         Enable verbose logging
   --quiet, -q           Minimal output mode
-  --trim-silence        Trim extended silences (>1s) to natural pause lengths
-                        (0.2-0.8s)
+  --trim-silence        Trim extended silences (>1s) to natural pause lengths (0.2-0.8s)
   --silence-threshold SILENCE_THRESHOLD
-                        Silence detection threshold in dB (default: -30,
-                        lower=more sensitive)
-  --intensive-cleanup   Enable intensive post-AI cleanup (may cause reverb
-                        artifacts, disabled by default)
-  --use-loudnorm        Use loudnorm instead of dynaudnorm (may sound over-
-                        processed)
-  --overwrite           Overwrite existing output files (default: skip
-                        existing files)
+                        Silence detection threshold in dB (default: -30, lower=more sensitive)
+  --intensive-cleanup   Enable intensive post-AI cleanup (may cause reverb artifacts, disabled by default)
+  --use-loudnorm        Use loudnorm instead of dynaudnorm (may sound over-processed)
+  --overwrite           Overwrite existing output files (default: skip existing files)
   --format {wav,mp3}, -f {wav,mp3}
                         Output audio format (default: wav)
-  --two-pass-loudnorm   Use professional two-pass loudnorm for superior volume
-                        consistency (default: enabled)
+  --two-pass-loudnorm   Use professional two-pass loudnorm for superior volume consistency (default: enabled)
   --single-pass-loudnorm
-                        Use single-pass loudnorm instead of two-pass (faster
-                        but less accurate)
-  --no-speechbrain      Disable SpeechBrain MTL-MIMIC voice enhancement
-                        (default: enabled)
-  --save-stems          Save all Demucs stems (vocals, drums, bass, other)
-                        when using Demucs pipeline
-  --stems-only          Only separate into vocal and background stems without
-                        any processing or normalization
-  --voice-consistent    Use voice-consistent normalization for uniform voice
-                        levels throughout audio (fixes level variations)
+                        Use single-pass loudnorm instead of two-pass (faster but less accurate)
+  --no-speechbrain      Disable SpeechBrain MTL-MIMIC voice enhancement (default: enabled)
+  --save-stems          Save all Demucs stems (vocals, drums, bass, other) when using Demucs pipeline
+  --stems-only          Only separate into vocal and background stems without any processing or normalization
+  --voice-consistent    Use voice-consistent normalization for uniform voice levels throughout audio (fixes level variations)
+  --separator {demucs,roformer,mel-roformer}
+                        Vocal separator: roformer (default, BS-RoFormer SDR 12.97), demucs, or mel-roformer (Mel-Band-RoFormer, SDR 11.4). roformer/mel-
+                        roformer require: pip install audio-separator. --save-stems and --stems-only produce vocals + background (2 stems, not 4).
 
 Examples:
   audionorm.py audio.wav
   audionorm.py /path/to/audio/folder --recursive
   audionorm.py audio.wav --target-lufs -23 --model htdemucs
   audionorm.py folder/ --device cuda --keep-temp --quiet
-
 ```
 
 ## AudioScribe - Speech Transcription
